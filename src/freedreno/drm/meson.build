@@ -73,6 +73,7 @@ libfreedreno_kgsl_files = files(
 if freedreno_kmds.contains('kgsl')
   libfreedreno_drm_files += libfreedreno_kgsl_files
   libfreedreno_drm_flags += '-DHAVE_FREEDRENO_KGSL'
+  libfreedreno_drm_link_with += libvdrm
 endif
 
 libfreedreno_drm = static_library(
