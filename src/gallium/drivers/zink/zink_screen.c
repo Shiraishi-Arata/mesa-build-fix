@@ -30,7 +30,6 @@
 #include "zink_fence.h"
 #include "vk_format.h"
 #include "zink_format.h"
-#include "zink_framebuffer.h"
 #include "zink_program.h"
 #include "zink_public.h"
 #include "zink_query.h"
@@ -116,8 +115,8 @@ zink_debug_options[] = {
    { "nobgc", ZINK_DEBUG_NOBGC, "Disable all async pipeline compiles" },
    { "mem", ZINK_DEBUG_MEM, "Debug memory allocations" },
    { "quiet", ZINK_DEBUG_QUIET, "Suppress warnings" },
-   { "ioopt", ZINK_DEBUG_IOOPT, "Optimize IO" },
    { "nopc", ZINK_DEBUG_NOPC, "No precompilation" },
+   { "msaaopt", ZINK_DEBUG_MSAAOPT, "Optimize out loads/stores of MSAA attachments" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -603,6 +602,7 @@ zink_init_shader_caps(struct zink_screen *screen)
          screen->info.feats12.shaderFloat16 ||
          (screen->info.have_KHR_shader_float16_int8 &&
           screen->info.shader_float16_int8_feats.shaderFloat16);
+      caps->glsl_16bit_load_dst = true;
 
       caps->int16 = screen->info.feats.features.shaderInt16;
 
@@ -672,7 +672,6 @@ zink_init_compute_caps(struct zink_screen *screen)
    caps->max_local_size =
       screen->info.props.limits.maxComputeSharedMemorySize;
 
-   caps->images_supported = true;
    caps->subgroup_sizes = screen->info.props11.subgroupSize;
    caps->max_mem_alloc_size = screen->clamp_video_mem;
    caps->max_global_size = screen->total_video_mem;
@@ -727,9 +726,9 @@ zink_init_screen_caps(struct zink_screen *screen)
 #if defined(MVK_VERSION)
    caps->fbfetch = 0;
 #else
-   caps->fbfetch = 1;
+   caps->fbfetch = screen->info.have_KHR_dynamic_rendering_local_read;
 #endif
-   caps->fbfetch_coherent = screen->info.have_EXT_rasterization_order_attachment_access;
+   caps->fbfetch_coherent = caps->fbfetch && screen->info.have_EXT_rasterization_order_attachment_access;
 
    caps->memobj =
       screen->instance_info->have_KHR_external_memory_capabilities &&
@@ -745,6 +744,8 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    caps->surface_reinterpret_blocks =
       screen->info.have_vulkan11 || screen->info.have_KHR_maintenance2;
+   caps->compressed_surface_reinterpret_blocks_layered = caps->surface_reinterpret_blocks &&
+                                                         screen->info.maint6_props.blockTexelViewCompatibleMultipleLayers;
 
    caps->validate_all_dirty_states = true;
    caps->allow_mapped_buffers_during_execution = true;
@@ -794,8 +795,6 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->texture_mirror_clamp_to_edge =
       screen->info.have_KHR_sampler_mirror_clamp_to_edge ||
       (screen->info.have_vulkan12 && screen->info.feats12.samplerMirrorClampToEdge);
-
-   caps->polygon_offset_units_unscaled = true;
 
    caps->polygon_offset_clamp = screen->info.feats.features.depthBiasClamp;
 
@@ -862,8 +861,9 @@ zink_init_screen_caps(struct zink_screen *screen)
        screen->info.have_EXT_shader_subgroup_ballot);
 
    caps->demote_to_helper_invocation =
-      screen->spirv_version >= SPIRV_VERSION(1, 6) ||
-      screen->info.have_EXT_shader_demote_to_helper_invocation;
+      (screen->spirv_version >= SPIRV_VERSION(1, 6) ||
+       screen->info.have_EXT_shader_demote_to_helper_invocation) &&
+      !screen->driver_compiler_workarounds.broken_demote;
 
    caps->sample_shading = screen->info.feats.features.sampleRateShading;
 
@@ -926,6 +926,8 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    caps->min_texel_offset = screen->info.props.limits.minTexelOffset;
    caps->max_texel_offset = screen->info.props.limits.maxTexelOffset;
+
+   caps->max_timeline_semaphore_difference = screen->info.timeline_props.maxTimelineSemaphoreValueDifference;
 
    caps->vertex_color_unclamped = true;
 
@@ -1364,6 +1366,11 @@ zink_is_format_supported(struct pipe_screen *pscreen,
          }
       }
 
+      /* We can't swizzle buffer views */
+      if (bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE) &&
+          util_format_is_intensity(format))
+          return false;
+
       if (bind & PIPE_BIND_SAMPLER_VIEW &&
          !(props->bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT))
             return false;
@@ -1403,6 +1410,10 @@ zink_is_format_supported(struct pipe_screen *pscreen,
 
       if (bind & PIPE_BIND_SHADER_IMAGE &&
           !(props->optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+         return false;
+
+      /* Can't swizzle storage images. */
+      if (bind & PIPE_BIND_SHADER_IMAGE && util_format_is_intensity(format))
          return false;
    }
 
@@ -1669,6 +1680,7 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
       unsigned pdev_count = 1;
       VkResult result = VKSCR(EnumeratePhysicalDevices)(screen->instance, &pdev_count, &pdev);
       if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+         
             mesa_loge("ZINK: vkEnumeratePhysicalDevices failed (%s)", vk_Result_to_str(result));
          return;
       }
@@ -1679,7 +1691,7 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
 
    /* allow software rendering only if forced by the user */
-   if ((!cpu && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)) {
+   if (!cpu && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
       screen->pdev = VK_NULL_HANDLE;
       return;
    }
@@ -2298,6 +2310,27 @@ zink_create_exportable_semaphore(struct zink_screen *screen)
    return ret == VK_SUCCESS ? sem : VK_NULL_HANDLE;
 }
 
+#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
+static int
+zink_resource_get_dma_buf(struct zink_screen *screen, struct zink_resource *res)
+{
+   if (res->obj->is_aux) {
+      return os_dupfd_cloexec(res->obj->handle);
+   } else {
+      VkMemoryGetFdInfoKHR fd_info = {0};
+      fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+      fd_info.memory = zink_bo_get_mem(res->obj->bo);
+      fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+      int fd;
+      if (VKSCR(GetMemoryFdKHR)(screen->dev, &fd_info, &fd) != VK_SUCCESS)
+         return -1;
+
+      return fd;
+   }
+}
+#endif
+
 VkSemaphore
 zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res)
 {
@@ -2308,23 +2341,14 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
       .fd = -1,
    };
 
-   int fd = -1;
-   if (res->obj->is_aux) {
-      fd = os_dupfd_cloexec(res->obj->handle);
-   } else {
-      VkMemoryGetFdInfoKHR fd_info = {0};
-      fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-      fd_info.memory = zink_bo_get_mem(res->obj->bo);
-      fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      VKSCR(GetMemoryFdKHR)(screen->dev, &fd_info, &fd);
-   }
-
+   int fd = zink_resource_get_dma_buf(screen, res);
    if (unlikely(fd < 0)) {
       mesa_loge("MESA: Unable to get a valid memory fd");
       return VK_NULL_HANDLE;
    }
 
    int ret = drmIoctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
+   close(fd);
    if (ret) {
       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
          assert(!"how did this fail?");
@@ -2345,8 +2369,8 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
       .fd = export.fd,
    };
    bool success = VKSCR(ImportSemaphoreFdKHR)(screen->dev, &sdi) == VK_SUCCESS;
-   close(fd);
    if (!success) {
+      close(export.fd);
       VKSCR(DestroySemaphore)(screen->dev, sem, NULL);
       return VK_NULL_HANDLE;
    }
@@ -2370,17 +2394,7 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
    }
 
    bool ret = false;
-   int fd;
-   if (res->obj->is_aux) {
-      fd = os_dupfd_cloexec(res->obj->handle);
-   } else {
-      VkMemoryGetFdInfoKHR fd_info = {0};
-      fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-      fd_info.memory = zink_bo_get_mem(res->obj->bo);
-      fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      if (VKSCR(GetMemoryFdKHR)(screen->dev, &fd_info, &fd) != VK_SUCCESS)
-         fd = -1;
-   }
+   int fd = zink_resource_get_dma_buf(screen, res);
    if (fd != -1) {
       struct dma_buf_import_sync_file import = {
          .flags = DMA_BUF_SYNC_RW,
@@ -2762,7 +2776,7 @@ static void
 init_driver_workarounds(struct zink_screen *screen)
 {
    /* enable implicit sync for all non-mesa drivers */
-   screen->driver_workarounds.implicit_sync = screen->info.driver_props.driverID != VK_DRIVER_ID_MESA_VENUS;
+   screen->driver_workarounds.implicit_sync = !zink_driver_is_venus(screen);
    switch (zink_driverid(screen)) {
    case VK_DRIVER_ID_MESA_RADV:
    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
@@ -2823,7 +2837,6 @@ init_driver_workarounds(struct zink_screen *screen)
                                                         ((zink_debug & ZINK_DEBUG_GPL) ||
                                                          screen->info.dynamic_state2_feats.extendedDynamicState2PatchControlPoints) &&
                                                         screen->info.have_EXT_extended_dynamic_state3 &&
-                                                        screen->info.have_KHR_dynamic_rendering &&
                                                         screen->info.have_EXT_non_seamless_cube_map &&
                                                         (!(zink_debug & ZINK_DEBUG_GPL) ||
                                                          screen->info.gpl_props.graphicsPipelineLibraryFastLinking ||
@@ -2848,10 +2861,9 @@ init_driver_workarounds(struct zink_screen *screen)
    }
 
    if (zink_driverid(screen) ==
-       VK_DRIVER_ID_IMAGINATION_PROPRIETARY) {
-      assert(screen->info.feats.features.geometryShader);
+       VK_DRIVER_ID_IMAGINATION_PROPRIETARY &&
+       screen->info.feats.features.geometryShader)
       screen->driver_workarounds.no_linesmooth = true;
-   }
 
    /* This is a workarround for the lack of
     * gl_PointSize + glPolygonMode(..., GL_LINE), in the imagination
@@ -2866,17 +2878,6 @@ init_driver_workarounds(struct zink_screen *screen)
       break;
    }
 
-   if (zink_driverid(screen) == VK_DRIVER_ID_AMD_OPEN_SOURCE || 
-       zink_driverid(screen) == VK_DRIVER_ID_AMD_PROPRIETARY || 
-       zink_driverid(screen) == VK_DRIVER_ID_NVIDIA_PROPRIETARY || 
-       zink_driverid(screen) == VK_DRIVER_ID_MESA_RADV)
-      screen->driver_workarounds.z24_unscaled_bias = 1<<23;
-   else
-      screen->driver_workarounds.z24_unscaled_bias = 1<<24;
-   if (zink_driverid(screen) == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
-      screen->driver_workarounds.z16_unscaled_bias = 1<<15;
-   else
-      screen->driver_workarounds.z16_unscaled_bias = 1<<16;
    /* these drivers don't use VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT, so it can always be set */
    switch (zink_driverid(screen)) {
    case VK_DRIVER_ID_MESA_RADV:
@@ -2938,6 +2939,16 @@ init_driver_workarounds(struct zink_screen *screen)
       break;
    }
 
+   /* these drivers do not implement demote properly */
+   switch (zink_driverid(screen)) {
+   case VK_DRIVER_ID_IMAGINATION_PROPRIETARY:
+      screen->driver_compiler_workarounds.broken_demote = true;
+      break;
+   default:
+      screen->driver_compiler_workarounds.broken_demote = false;
+      break;
+   }
+
    /* When robust contexts are advertised but robustImageAccess2 is not available */
    screen->driver_compiler_workarounds.lower_robustImageAccess2 =
       !screen->info.rb2_feats.robustImageAccess2 &&
@@ -2982,6 +2993,8 @@ init_driver_workarounds(struct zink_screen *screen)
    default:
       break;
    }
+   if (zink_driver_is_venus(screen))
+      screen->driver_workarounds.can_do_invalid_linear_modifier = true;
 
    /* these drivers have no difference between unoptimized and optimized shader compilation */
    switch (zink_driverid(screen)) {
@@ -3028,26 +3041,26 @@ init_driver_workarounds(struct zink_screen *screen)
       break;
    }
 
+   switch (zink_driverid(screen)) {
+   case VK_DRIVER_ID_MESA_LLVMPIPE:
+   case VK_DRIVER_ID_MESA_NVK:
+   case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+   case VK_DRIVER_ID_MESA_TURNIP:
+   case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
+      screen->driver_workarounds.general_layout = true;
+      break;
+   default:
+      screen->driver_workarounds.general_layout = screen->info.have_KHR_unified_image_layouts;
+      break;
+   }
+
    if (!screen->resizable_bar)
       screen->info.have_EXT_host_image_copy = false;
 }
 
 static void
-fixup_driver_props(struct zink_screen *screen)
+check_hic_shader_read(struct zink_screen *screen)
 {
-   VkPhysicalDeviceProperties2 props = {
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
-   };
-   if (screen->info.have_EXT_host_image_copy) {
-      /* fill in layouts */
-      screen->info.hic_props.pNext = props.pNext;
-      props.pNext = &screen->info.hic_props;
-      screen->info.hic_props.pCopySrcLayouts = ralloc_array(screen, VkImageLayout, screen->info.hic_props.copySrcLayoutCount);
-      screen->info.hic_props.pCopyDstLayouts = ralloc_array(screen, VkImageLayout, screen->info.hic_props.copyDstLayoutCount);
-   }
-   if (props.pNext)
-      screen->vk.GetPhysicalDeviceProperties2(screen->pdev, &props);
-
    if (screen->info.have_EXT_host_image_copy) {
       for (unsigned i = 0; i < screen->info.hic_props.copyDstLayoutCount; i++) {
          if (screen->info.hic_props.pCopyDstLayouts[i] == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
@@ -3255,6 +3268,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->loader_lib = (void*) strtoul(getenv("VULKAN_PTR"), NULL, 0x10);
    if (!screen->loader_lib) {
+      
          mesa_loge("ZINK: failed to load "VK_LIBNAME);
       goto fail;
    }
@@ -3263,6 +3277,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetDeviceProcAddr");
    if (!screen->vk_GetInstanceProcAddr ||
        !screen->vk_GetDeviceProcAddr) {
+      
          mesa_loge("ZINK: failed to get proc address");
       goto fail;
    }
@@ -3295,6 +3310,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (zink_debug & ZINK_DEBUG_VALIDATION) {
       if (!screen->instance_info->have_layer_KHRONOS_validation &&
           !screen->instance_info->have_layer_LUNARG_standard_validation) {
+         
             mesa_loge("Failed to load validation layer");
          goto fail;
       }
@@ -3311,11 +3327,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    if (screen->instance_info->have_EXT_debug_utils &&
       (zink_debug & ZINK_DEBUG_VALIDATION) && !create_debug(screen)) {
+      
          debug_printf("ZINK: failed to setup debug utils\n");
    }
 
    choose_pdev(screen, dev_major, dev_minor, adapter_luid);
    if (screen->pdev == VK_NULL_HANDLE) {
+      
          mesa_loge("ZINK: failed to choose pdev");
       goto fail;
    }
@@ -3332,7 +3350,20 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->have_dynamic_state_vertex_input_binding_stride = true;
 
    if (!zink_get_physical_device_info(screen)) {
+      
          debug_printf("ZINK: failed to detect features\n");
+      goto fail;
+   }
+
+   if(zink_driverid(screen) == VK_DRIVER_ID_ARM_PROPRIETARY) {
+      const char* mali_geom_override = getenv("ZINK_EANBLE_GS_ARM");
+      bool geomShader = mali_geom_override != NULL && *mali_geom_override == '1';
+      printf("ZINK: ARM Mali detected, geometry shaders are %s\n", geomShader ? "enabled (override)" : "forcibly disabled");
+      screen->info.feats.features.geometryShader = geomShader;
+   }
+
+   if (!screen->info.rb2_feats.nullDescriptor) {
+      mesa_loge("Zink requires the nullDescriptor feature of KHR/EXT robustness2.");
       goto fail;
    }
 
@@ -3386,19 +3417,22 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    setup_renderdoc(screen);
    if (screen->threaded_submit && !util_queue_init(&screen->flush_queue, "zfq", 8, 1, UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen)) {
+      
          mesa_loge("zink: Failed to create flush queue.\n");
       goto fail;
    }
 
    zink_internal_setup_moltenvk(screen);
    if (!screen->info.have_KHR_timeline_semaphore && !screen->info.feats12.timelineSemaphore) {
+      
          mesa_loge("zink: KHR_timeline_semaphore is required");
       goto fail;
    }
 
-   if (zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY && !screen->info.feats.features.geometryShader) {
-         mesa_loge("zink: Imagination proprietary driver w/o geometryShader is unsupported");
-      goto fail;
+   /* Reject IMG blobs with DDK below 24.1@6554834 if not forced */
+   if (zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_PROPRIETARY && screen->info.props.driverVersion < 6554834) {
+      debug_printf("zink: Imagination proprietary driver is too old to be supported, expect failure\n");
+         goto fail;
    }
 
    if (zink_debug & ZINK_DEBUG_MEM) {
@@ -3406,7 +3440,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       screen->debug_mem_sizes = _mesa_hash_table_create(screen, _mesa_hash_string, _mesa_key_string_equal);
    }
 
-   fixup_driver_props(screen);
+   check_hic_shader_read(screen);
 
    init_driver_workarounds(screen);
 
@@ -3500,6 +3534,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
    if (!os_get_total_physical_memory(&screen->total_mem)) {
+      
          mesa_loge("ZINK: failed to get total physical memory");
       goto fail;
    }
@@ -3523,15 +3558,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (!zink_screen_resource_init(&screen->base))
       goto fail;
    if (!zink_bo_init(screen)) {
+      
          mesa_loge("ZINK: failed to initialize suballocator");
       goto fail;
    }
    zink_screen_fence_init(&screen->base);
 
-   if (zink_debug & ZINK_DEBUG_IOOPT)
-      screen->driver_compiler_workarounds.io_opt = true;
    zink_screen_init_compiler(screen);
    if (!disk_cache_init(screen)) {
+      
          mesa_loge("ZINK: failed to initialize disk cache");
       goto fail;
    }
@@ -3545,6 +3580,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->driconf.inline_uniforms = debug_get_bool_option("ZINK_INLINE_UNIFORMS", screen->is_cpu);
 
    if (!zink_screen_init_semaphore(screen)) {
+      
          mesa_loge("zink: failed to create timeline semaphore");
       goto fail;
    }
@@ -3553,6 +3589,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    {
       if (!screen->info.have_EXT_descriptor_buffer) {
          if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+            
                mesa_loge("Cannot use db descriptor mode without EXT_descriptor_buffer");
             goto fail;
          }
@@ -3560,6 +3597,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       }
       if (!screen->resizable_bar) {
          if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+            
                mesa_loge("Cannot use db descriptor mode without resizable bar");
             goto fail;
          }
@@ -3567,20 +3605,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       }
       if (!screen->info.have_EXT_non_seamless_cube_map) {
          if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+            
                mesa_loge("Cannot use db descriptor mode without EXT_non_seamless_cube_map");
-            goto fail;
-         }
-         can_db = false;
-      }
-      if (!screen->info.rb2_feats.nullDescriptor) {
-         if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
-               mesa_loge("Cannot use db descriptor mode without robustness2.nullDescriptor");
             goto fail;
          }
          can_db = false;
       }
       if (ZINK_FBFETCH_DESCRIPTOR_SIZE < screen->info.db_props.inputAttachmentDescriptorSize) {
          if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+            
                mesa_loge("Cannot use db descriptor mode with inputAttachmentDescriptorSize(%u) > %u", (unsigned)screen->info.db_props.inputAttachmentDescriptorSize, ZINK_FBFETCH_DESCRIPTOR_SIZE);
             goto fail;
          }
@@ -3645,11 +3678,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    zink_init_screen_pipeline_libs(screen);
 
    if (!init_layouts(screen)) {
+      
          mesa_loge("ZINK: failed to initialize layouts");
       goto fail;
    }
 
    if (!zink_descriptor_layouts_init(screen)) {
+      
          mesa_loge("ZINK: failed to initialize descriptor layouts");
       goto fail;
    }

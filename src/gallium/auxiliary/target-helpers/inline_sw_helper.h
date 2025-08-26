@@ -124,6 +124,9 @@ sw_screen_create_vk(struct sw_winsys *winsys, bool sw_vk)
 #if defined(GALLIUM_SOFTPIPE)
       (sw_vk ? "" : "softpipe"),
 #endif
+#if defined(GALLIUM_ZINK)
+      (sw_vk || only_sw) ? "" : "zink",
+#endif
    };
 
    for (unsigned i = 0; i < ARRAY_SIZE(drivers); i++) {

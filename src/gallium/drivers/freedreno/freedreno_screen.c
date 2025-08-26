@@ -214,6 +214,8 @@ fd_init_shader_caps(struct fd_screen *screen)
       case PIPE_SHADER_GEOMETRY:
          if (!is_a6xx(screen))
             continue;
+         if (screen->info->a6xx.is_a702)
+            continue;
          break;
       case PIPE_SHADER_COMPUTE:
          if (!has_compute(screen))
@@ -233,7 +235,8 @@ fd_init_shader_caps(struct fd_screen *screen)
       caps->max_inputs = is_a6xx(screen) && i != PIPE_SHADER_GEOMETRY ?
          screen->info->a6xx.vs_max_inputs_count : 16;
 
-      caps->max_outputs = is_a6xx(screen) ? 32 : 16;
+      caps->max_outputs =
+         (is_a6xx(screen) && !screen->info->a6xx.is_a702) ? 32 : 16;
 
       caps->max_temps = 64; /* Max native temporaries. */
 
@@ -261,6 +264,7 @@ fd_init_shader_caps(struct fd_screen *screen)
          (is_a5xx(screen) || is_a6xx(screen)) &&
          (i == PIPE_SHADER_COMPUTE || i == PIPE_SHADER_FRAGMENT) &&
          !FD_DBG(NOFP16);
+      caps->glsl_16bit_load_dst = true;
 
       caps->max_texture_samplers =
       caps->max_sampler_views = 16;
@@ -310,6 +314,7 @@ fd_init_shader_caps(struct fd_screen *screen)
 static void
 fd_init_compute_caps(struct fd_screen *screen)
 {
+   const struct fd_dev_info *info = screen->info;
    struct pipe_compute_caps *caps =
       (struct pipe_compute_caps *)&screen->base.compute_caps;
 
@@ -330,24 +335,22 @@ fd_init_compute_caps(struct fd_screen *screen)
    caps->max_block_size[1] = 1024;
    caps->max_block_size[2] = 64;
 
-   caps->max_threads_per_block = 1024;
+   caps->max_threads_per_block = info->threadsize_base * info->max_waves;
+
+   if (is_a6xx(screen) && info->a6xx.supports_double_threadsize)
+      caps->max_threads_per_block *= 2;
 
    caps->max_global_size = screen->ram_size;
 
    caps->max_local_size = screen->info->cs_shared_mem_size;
 
-   caps->max_private_size =
-   caps->max_input_size = 4096;
-
    caps->max_mem_alloc_size = screen->ram_size;
 
    caps->max_clock_frequency = screen->max_freq / 1000000;
 
-   caps->max_compute_units = 9999; // TODO
+   caps->max_compute_units = screen->info->num_sp_cores;
 
-   caps->images_supported = true;
-
-   caps->subgroup_sizes = 32; // TODO
+   caps->subgroup_sizes = screen->info->max_waves;
 
    caps->max_variable_threads_per_block = compiler->max_variable_workgroup_size;
 }
@@ -484,16 +487,36 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->int64 =
    caps->doubles = is_ir3(screen);
 
-   caps->glsl_feature_level =
-   caps->glsl_feature_level_compatibility =
-      is_a6xx(screen) ? 460 : (is_ir3(screen) ? 140 : 120);
+   if (is_a6xx(screen)) {
+      if (screen->info->a6xx.is_a702) {
+         /* a702 family is a special case, no gs/tess: */
+         caps->glsl_feature_level = 140;
+         caps->essl_feature_level = 310;
+      } else {
+         /* a6xx+*/
+         caps->glsl_feature_level = 460;
+         caps->essl_feature_level = 320;
+      }
+   } else if (is_a5xx(screen) || is_a4xx(screen)) {
+      caps->glsl_feature_level = 140;
+      caps->essl_feature_level = 320;
+   } else if (is_a3xx(screen)) {
+      caps->glsl_feature_level = 140;
+      caps->essl_feature_level = 300;
+   } else { /* a2xx */
+      caps->glsl_feature_level = 120;
+      caps->essl_feature_level = 100;
+   }
 
-   caps->essl_feature_level =
-      is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen) ? 320 :
-      (is_ir3(screen) ? 300 : 120);
+   caps->glsl_feature_level_compatibility = caps->glsl_feature_level;
 
    caps->shader_buffer_offset_alignment =
       is_a6xx(screen) ? 64 : (is_a5xx(screen) || is_a4xx(screen) ? 4 : 0);
+
+   if (is_a6xx(screen)) {
+      caps->linear_image_pitch_alignment = 64;
+      caps->linear_image_base_address_alignment = 64;
+   }
 
    caps->max_texture_gather_components =
       is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen) ? 4 : 0;
@@ -524,7 +547,7 @@ fd_init_screen_caps(struct fd_screen *screen)
 
    caps->max_viewports = is_a6xx(screen) ? 16 : 1;
 
-   caps->max_varyings = is_a6xx(screen) ? 31 : 16;
+   caps->max_varyings = (is_a6xx(screen) && !screen->info->a6xx.is_a702) ? 31 : 16;
 
    /* We don't really have a limit on this, it all goes into the main
     * memory buffer. Needs to be at least 120 / 4 (minimum requirement
@@ -571,8 +594,9 @@ fd_init_screen_caps(struct fd_screen *screen)
       (is_a5xx(screen) ? 0 : 1);
 
    /* Stream output. */
-   caps->max_vertex_streams = is_a6xx(screen) ?  /* has SO + GS */
-      PIPE_MAX_SO_BUFFERS : 0;
+   caps->max_vertex_streams =
+      (is_a6xx(screen) && !screen->info->a6xx.is_a702) ?  /* has SO + GS */
+         PIPE_MAX_SO_BUFFERS : 0;
    caps->max_stream_output_buffers = is_ir3(screen) ? PIPE_MAX_SO_BUFFERS : 0;
    caps->stream_output_pause_resume =
    caps->stream_output_interleave_buffers =
@@ -584,6 +608,7 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->shader_group_vote = is_a6xx(screen);
    caps->fs_face_is_integer_sysval = true;
    caps->fs_point_is_sysval = is_a2xx(screen);
+   /* TODO this is correct for a702 but otherwise I think it should be 2x this: */
    caps->max_stream_output_separate_components =
    caps->max_stream_output_interleaved_components = is_ir3(screen) ?
       16 * 4 /* should only be shader out limit? */ : 0;
@@ -652,8 +677,8 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->shader_clock = is_a6xx(screen);
 }
 
-static const void *
-fd_get_compiler_options(struct pipe_screen *pscreen, enum pipe_shader_ir ir,
+static const struct nir_shader_compiler_options *
+fd_get_compiler_options(struct pipe_screen *pscreen,
                         enum pipe_shader_type shader)
 {
    struct fd_screen *screen = fd_screen(pscreen);
@@ -720,6 +745,12 @@ is_format_supported(struct pipe_screen *pscreen,
    return modifier == DRM_FORMAT_MOD_LINEAR;
 }
 
+static bool
+is_rendering_supported(struct pipe_screen *pscreen, enum pipe_format format)
+{
+   return pscreen->is_format_supported(pscreen, format, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_RENDER_TARGET);
+}
+
 static void
 fd_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
                                  enum pipe_format format, int max,
@@ -743,7 +774,7 @@ fd_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
             modifiers[num] = all_modifiers[i];
 
          if (external_only)
-            external_only[num] = false;
+            external_only[num] = !is_rendering_supported(pscreen, format);
       }
 
       num++;
@@ -945,17 +976,6 @@ fd_screen_create(int fd,
    screen->dev_info = info;
    screen->info = &screen->dev_info;
 
-   /* explicitly checking for GPU revisions that are known to work.  This
-    * may be overly conservative for a3xx, where spoofing the gpu_id with
-    * the blob driver seems to generate identical cmdstream dumps.  But
-    * on a2xx, there seem to be small differences between the GPU revs
-    * so it is probably better to actually test first on real hardware
-    * before enabling:
-    *
-    * If you have a different adreno version, feel free to add it to one
-    * of the cases below and see what happens.  And if it works, please
-    * send a patch ;-)
-    */
    switch (screen->gen) {
    case 2:
       fd2_screen_init(pscreen);
