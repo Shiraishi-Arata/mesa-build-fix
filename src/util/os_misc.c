@@ -32,6 +32,7 @@
 #include "os_file.h"
 #include "ralloc.h"
 #include "simple_mtx.h"
+#include "u_debug.h"
 
 #include <stdarg.h>
 
@@ -56,6 +57,7 @@
 #  define LOG_TAG "MESA"
 #  include <unistd.h>
 #  include <log/log.h>
+#  include <cutils/properties.h>
 #elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
 #  include <unistd.h>
 #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
@@ -135,30 +137,143 @@ os_log_message(const char *message)
 #endif
 }
 
+#if DETECT_OS_ANDROID
+#  include <ctype.h>
+#  include "c11/threads.h"
+
+/**
+ * In Android 26+ there is no restriction on the length of the name for a
+ * property, replace the default max length with one large enough to support
+ * all property names.
+ */
+#if ANDROID_API_LEVEL >= 26
+#undef PROPERTY_KEY_MAX
+#define PROPERTY_KEY_MAX 128
+#endif /* ANDROID_API_LEVEL >= 26 */
+
+/**
+ * Get an option value from android's property system, as a fallback to
+ * getenv() (which is generally less useful on android due to processes
+ * typically being forked from the zygote.
+ *
+ * The option name used for getenv is translated into a property name
+ * by:
+ *
+ *  1) convert to lowercase
+ *  2) replace '_' with '.'
+ *  3) replace "MESA_" or prepend with "mesa."
+ *  4) look for "debug.mesa." prefix
+ *  5) look for "vendor.mesa." prefix
+ *  6) look for "mesa." prefix
+ *
+ * For example:
+ *  - MESA_EXTENSION_OVERRIDE -> mesa.extension.override
+ *  - GALLIUM_HUD -> mesa.gallium.hud
+ *
+ */
+static char *
+os_get_android_option(const char *name)
+{
+   static thread_local char os_android_option_value[PROPERTY_VALUE_MAX];
+   char key[PROPERTY_KEY_MAX];
+   char *p = key, *end = key + PROPERTY_KEY_MAX;
+   /* add "mesa." prefix if necessary: */
+   if (strstr(name, "MESA_") != name)
+      p += strlcpy(p, "mesa.", end - p);
+   p += strlcpy(p, name, end - p);
+   for (int i = 0; key[i]; i++) {
+      if (key[i] == '_') {
+         key[i] = '.';
+      } else {
+         key[i] = tolower(key[i]);
+      }
+   }
+
+   /* prefixes to search sorted by preference */
+   const char *prefices[] = { "debug.", "vendor.", "" };
+   char full_key[PROPERTY_KEY_MAX];
+   int len = 0;
+   for (int i = 0; i < ARRAY_SIZE(prefices); i++) {
+      strlcpy(full_key, prefices[i], PROPERTY_KEY_MAX);
+      strlcat(full_key, key, PROPERTY_KEY_MAX);
+      len = property_get(full_key, os_android_option_value, NULL);
+      if (len > 0)
+         return os_android_option_value;
+   }
+   return NULL;
+}
+#endif
+
 #if DETECT_OS_WINDOWS
 
 /* getenv doesn't necessarily reflect changes to the environment
  * that have been made during the process lifetime, if either the
  * setter uses a different CRT (e.g. due to static linking) or the
  * setter used the Win32 API directly. */
-const char *
-os_get_option(const char *name)
+static const char *
+os_get_option_internal(const char *name, UNUSED bool use_secure_getenv)
 {
    static thread_local char value[_MAX_ENV];
    DWORD size = GetEnvironmentVariableA(name, value, _MAX_ENV);
    return (size > 0 && size < _MAX_ENV) ? value : NULL;
 }
 
+#else /* !DETECT_OS_WINDOWS */
+
+static const char *
+os_get_option_internal(const char *name, bool use_secure_getenv)
+{
+   const char *opt;
+   if (use_secure_getenv) {
+#ifdef HAVE_SECURE_GETENV
+      opt = secure_getenv(name);
 #else
+      opt = getenv(name);
+#endif
+   } else {
+      opt = getenv(name);
+   }
+#if DETECT_OS_ANDROID
+   if (!opt) {
+      opt = os_get_android_option(name);
+   }
+#endif
+   return opt;
+}
+
+#endif /* DETECT_OS_WINDOWS */
 
 const char *
 os_get_option(const char *name)
 {
-   const char *opt = getenv(name);
-   return opt;
+   return os_get_option_internal(name, false);
 }
 
-#endif
+char *
+os_get_option_dup(const char *name)
+{
+   const char *opt = os_get_option_internal(name, false);
+   if (opt) {
+      return strdup(opt);
+   }
+   return NULL;
+}
+
+const char *
+os_get_option_secure(const char *name)
+{
+   return os_get_option_internal(name, true);
+}
+
+char *
+os_get_option_secure_dup(const char *name)
+{
+   const char *opt = os_get_option_internal(name, true);
+   if (opt) {
+      return strdup(opt);
+   }
+   return NULL;
+}
 
 static struct hash_table *options_tbl;
 static bool options_tbl_exited = false;
@@ -213,6 +328,25 @@ exit_mutex:
    return opt;
 }
 
+void
+os_set_option(const char *name, const char *value, bool override)
+{
+   if (override == false) {
+      if (os_get_option(name)) {
+         return;
+      }
+   }
+#if DETECT_OS_WINDOWS
+   SetEnvironmentVariableA(name, value);
+#else
+   if (value == NULL) {
+      unsetenv(name);
+   } else {
+      setenv(name, value, 1);
+   }
+#endif
+}
+
 /**
  * Return the size of the total physical memory.
  * \param size returns the size of the total physical memory
@@ -221,9 +355,9 @@ exit_mutex:
 bool
 os_get_total_physical_memory(uint64_t *size)
 {
-#if DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
+#if HAVE_SYSCONF
    const long phys_pages = sysconf(_SC_PHYS_PAGES);
-   const long page_size = sysconf(_SC_PAGE_SIZE);
+   const long page_size = sysconf(_SC_PAGESIZE);
 
    if (phys_pages <= 0 || page_size <= 0)
       return false;
@@ -349,8 +483,8 @@ os_get_available_system_memory(uint64_t *size)
 bool
 os_get_page_size(uint64_t *size)
 {
-#if DETECT_OS_POSIX_LITE && !DETECT_OS_APPLE && !DETECT_OS_HAIKU
-   const long page_size = sysconf(_SC_PAGE_SIZE);
+#if HAVE_SYSCONF
+   const long page_size = sysconf(_SC_PAGESIZE);
 
    if (page_size <= 0)
       return false;
