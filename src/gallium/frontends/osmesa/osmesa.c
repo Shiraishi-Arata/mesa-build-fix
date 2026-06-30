@@ -63,7 +63,7 @@
 
 #include "state_tracker/st_context.h"
 
-#include "glapi/glapi.h"  /* for OSMesaGetProcAddress below */
+#include "mesa/glapi/glapi/glapi.h"  /* for OSMesaGetProcAddress below */
 
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
