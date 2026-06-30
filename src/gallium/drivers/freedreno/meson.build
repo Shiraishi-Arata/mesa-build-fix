@@ -226,15 +226,14 @@ freedreno_includes = [
   inc_freedreno, include_directories('ir3'),
 ]
 
-freedreno_c_args = [no_override_init_args]
+freedreno_c_args = [no_override_init_args, '-DFD_BO_NO_HARDPIN=1']
 freedreno_c_args += cc.get_supported_arguments([
   '-Wno-array-bounds',
   '-Wno-packed-bitfield-compat',
 ])
 
-freedreno_cpp_args = []
+freedreno_cpp_args = ['-DFD_BO_NO_HARDPIN=1']
 freedreno_cpp_args += cpp.get_supported_arguments([
-  '-DFD_BO_NO_HARDPIN=1',
   '-fno-exceptions',
   '-fno-rtti',
   '-Wno-address-of-packed-member',
