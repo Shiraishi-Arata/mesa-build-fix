@@ -34,6 +34,14 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
    DBG("%p: %p: flush: flags=%x, fencep=%p", ctx, batch, flags, fencep);
 
    if (fencep && !batch) {
+      if (!(flags & TC_FLUSH_ASYNC) && ctx->last_fence &&
+          (fd_pipe_fence_is_fd(ctx->last_fence) ||
+           !(flags & PIPE_FLUSH_FENCE_FD))) {
+         fd_pipe_fence_ref(&fence, ctx->last_fence);
+         fd_bc_dump(ctx, "%p: reuse last_fence, remaining:\n", ctx);
+         goto out;
+      }
+      fd_bc_dump(ctx, "need fence, last_fence=%p", ctx->last_fence);
       batch = fd_context_batch(ctx);
    } else if (!batch) {
       return;
@@ -46,12 +54,6 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
     * one created earlier
     */
    if ((flags & TC_FLUSH_ASYNC) && fencep) {
-      /* We don't currently expect async+flush in the fence-fd
-       * case.. for that to work properly we'd need TC to tell
-       * us in the create_fence callback that it needs an fd.
-       */
-      assert(!(flags & PIPE_FLUSH_FENCE_FD));
-
       fd_pipe_fence_set_batch(*fencep, batch);
       fd_pipe_fence_ref(&batch->fence, *fencep);
 
@@ -127,6 +129,9 @@ out:
 
    u_trace_context_process(&ctx->trace_context,
                            !!(flags & PIPE_FLUSH_END_OF_FRAME));
+
+   if (FD_DBG(ABORT))
+      assert(pctx->get_device_reset_status(pctx) == PIPE_NO_RESET);
 }
 
 static void
@@ -307,10 +312,26 @@ fd_context_add_private_bo(struct fd_context *ctx, struct fd_bo *bo)
 }
 
 /**
- * Return a reference to the current batch, caller must unref.
+ * Return a reference to the current batch, caller must unref.  For
+ * PIPE_CONTEXT_COMPUTE_ONLY contexts, this returns a nondraw batch,
+ * in order to avoid queries ending up in separate batches.
  */
 struct fd_batch *
 fd_context_batch(struct fd_context *ctx)
+{
+   if (ctx->flags & PIPE_CONTEXT_COMPUTE_ONLY) {
+      return fd_context_batch_nondraw(ctx);
+   } else {
+      return fd_context_batch_draw(ctx);
+   }
+}
+
+/**
+ * Return a reference to the current batch, caller must unref.  This
+ * returns specificall a draw batch.
+ */
+struct fd_batch *
+fd_context_batch_draw(struct fd_context *ctx)
 {
    struct fd_batch *batch = NULL;
 
@@ -363,6 +384,13 @@ fd_context_destroy(struct pipe_context *pctx)
    unsigned i;
 
    DBG("");
+
+   if (!(ctx->flags & FD_CONTEXT_FLAG_AUX))
+      p_atomic_dec(&pctx->screen->num_contexts);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->f16_blit_fs); i++)
+      if (ctx->f16_blit_fs[i])
+         pctx->delete_fs_state(pctx, ctx->f16_blit_fs[i]);
 
    fd_screen_lock(ctx->screen);
    list_del(&ctx->node);
@@ -474,22 +502,6 @@ fd_get_device_reset_status(struct pipe_context *pctx)
    ctx->global_reset_count = global_faults;
 
    return status;
-}
-
-static enum pipe_reset_status
-fd_get_device_reset_status_direct(struct pipe_context *pctx)
-{
-   struct fd_context *ctx = fd_context(pctx);
-   enum pipe_reset_status status_list[] = {
-      [FD_RESET_NO_ERROR] = PIPE_NO_RESET,
-      [FD_RESET_GUILTY] = PIPE_GUILTY_CONTEXT_RESET,
-      [FD_RESET_INNOCENT] = PIPE_INNOCENT_CONTEXT_RESET,
-      [FD_RESET_UNKNOWN] = PIPE_UNKNOWN_CONTEXT_RESET,
-   };
-   enum fd_reset_status fd_status;
-   ASSERTED int ret = fd_pipe_get_reset_status(ctx->pipe, &fd_status);
-   assert(!ret);
-   return status_list[fd_status];
 }
 
 static void
@@ -656,12 +668,12 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
    ctx->pipe = fd_pipe_new2(screen->dev, FD_PIPE_3D, prio);
 
    ctx->in_fence_fd = -1;
-/*
+
    if (fd_device_version(screen->dev) >= FD_VERSION_ROBUSTNESS) {
       ctx->context_reset_count = fd_get_reset_count(ctx, true);
       ctx->global_reset_count = fd_get_reset_count(ctx, false);
    }
-*/
+
    simple_mtx_init(&ctx->gmem_lock, mtx_plain);
 
    /* need some sane default in case gallium frontends don't
@@ -676,19 +688,12 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
    pctx->flush = fd_context_flush;
    pctx->emit_string_marker = fd_emit_string_marker;
    pctx->set_debug_callback = fd_set_debug_callback;
+   pctx->get_device_reset_status = fd_get_device_reset_status;
    pctx->create_fence_fd = fd_create_pipe_fence_fd;
    pctx->fence_server_sync = fd_pipe_fence_server_sync;
    pctx->fence_server_signal = fd_pipe_fence_server_signal;
    pctx->texture_barrier = fd_texture_barrier;
    pctx->memory_barrier = fd_memory_barrier;
-
-   if (fd_get_features(screen->dev) & FD_FEATURE_DIRECT_RESET) {
-      pctx->get_device_reset_status = fd_get_device_reset_status_direct;
-   } else if(fd_device_version(screen->dev) >= FD_VERSION_ROBUSTNESS) {
-      ctx->context_reset_count = fd_get_reset_count(ctx, true);
-      ctx->global_reset_count = fd_get_reset_count(ctx, false);
-      pctx->get_device_reset_status = fd_get_device_reset_status;
-   }
 
    pctx->stream_uploader = u_upload_create_default(pctx);
    if (!pctx->stream_uploader)
@@ -731,6 +736,9 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
                              fd_trace_delete_flush_data);
 
    fd_autotune_init(&ctx->autotune, screen->dev);
+
+   if (!(ctx->flags & FD_CONTEXT_FLAG_AUX))
+      p_atomic_inc(&pctx->screen->num_contexts);
 
    return pctx;
 
