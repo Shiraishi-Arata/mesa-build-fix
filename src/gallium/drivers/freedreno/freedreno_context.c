@@ -373,11 +373,6 @@ fd_context_destroy(struct pipe_context *pctx)
    if (ctx->in_fence_fd != -1)
       close(ctx->in_fence_fd);
 
-   for (i = 0; i < ARRAY_SIZE(ctx->pvtmem); i++) {
-      if (ctx->pvtmem[i].bo)
-         fd_bo_del(ctx->pvtmem[i].bo);
-   }
-
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
    fd_batch_reference(&ctx->batch, NULL); /* unref current batch */
 
@@ -703,7 +698,7 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
    slab_create_child(&ctx->transfer_pool, &screen->transfer_pool);
    slab_create_child(&ctx->transfer_pool_unsync, &screen->transfer_pool);
 
-   util_dynarray_init(&ctx->global_bindings, NULL);
+   ctx->global_bindings = UTIL_DYNARRAY_INIT;
 
    fd_draw_init(pctx);
    fd_resource_context_init(pctx);
