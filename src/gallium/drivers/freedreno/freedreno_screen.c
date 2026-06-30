@@ -231,7 +231,7 @@ fd_init_shader_caps(struct fd_screen *screen)
       caps->max_control_flow_depth = 8; /* XXX */
 
       caps->max_inputs = is_a6xx(screen) && i != PIPE_SHADER_GEOMETRY ?
-         screen->info->a6xx.vs_max_inputs_count : 16;
+         screen->info->props.vs_max_inputs_count : 16;
 
       caps->max_outputs = is_a6xx(screen) ? 32 : 16;
 
@@ -442,10 +442,10 @@ fd_init_screen_caps(struct fd_screen *screen)
 
    caps->sampler_reduction_minmax =
    caps->sampler_reduction_minmax_arb =
-      is_a6xx(screen) && screen->info->a6xx.has_sampler_minmax;
+      is_a6xx(screen) && screen->info->props.has_sampler_minmax;
 
    caps->programmable_sample_locations =
-      is_a6xx(screen) && screen->info->a6xx.has_sample_locations;
+      is_a6xx(screen) && screen->info->props.has_sample_locations;
 
    caps->polygon_offset_clamp = is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen);
 
