@@ -29,7 +29,7 @@ if cpu_family == 'x86_64'
   endif
 elif cpu_family == 'x86'
   blake3_defs += blake3_x86_no_simd_defs
-elif cpu_family == 'aarch64' and target_machine.endian() == 'little'
+elif cc.get_define('__aarch64__') == '1' and target_machine.endian() == 'little'
   files_blake3 += ['blake3_neon.c']
 endif
 
